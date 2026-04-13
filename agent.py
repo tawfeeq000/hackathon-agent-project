@@ -1,48 +1,57 @@
 import os
 import logging
 import datetime
-import asyncio
-import google.cloud.logging
-from google.cloud import datastore
 from dotenv import load_dotenv
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
-from mcp.server.fastmcp import FastMCP 
 
 from google.adk import Agent
 from google.adk.agents import SequentialAgent
 from google.adk.tools.tool_context import ToolContext
+from google.adk.runners import Runner
+from google.adk.sessions import InMemorySessionService
+from google.genai import types
 
 # --- 1. Setup Logging ---
 try:
+    import google.cloud.logging
     cloud_logging_client = google.cloud.logging.Client()
     cloud_logging_client.setup_logging()
 except Exception:
     logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
-model_name = os.getenv("MODEL", "gemini-1.5-flash")
+model_name = os.getenv("MODEL", "gemini-2.5-flash")
 
 # --- 2. Database Setup ---
-# PRO TIP: For the default database, leaving arguments empty is the most stable 
-# way to deploy on Google Cloud. It auto-detects the project and (default) DB.
-db = datastore.Client() 
-
-mcp = FastMCP("WorkspaceTools")
+# Leaving Client() arguments empty is the most stable way to deploy on Google
+# Cloud — it auto-detects the project and uses the (default) database.
+try:
+    from google.cloud import datastore
+    db = datastore.Client()
+except ImportError:
+    logging.warning("google-cloud-datastore not installed. DB operations will fail gracefully.")
+    datastore = None  # type: ignore[assignment]
+    db = None
+except Exception as _db_err:
+    logging.warning(f"Datastore client unavailable: {_db_err}. DB operations will fail gracefully.")
+    # datastore module was imported successfully; only the client failed
+    db = None
 
 # ================= 3. TOOLS =================
 
-@mcp.tool()
 def add_task(title: str) -> str:
     """Adds a new task to the workspace."""
+    if db is None:
+        return "Database not available."
     try:
         key = db.key('Task')
         task = datastore.Entity(key=key)
         task.update({
-            'title': title, 
-            'completed': False, 
+            'title': title,
+            'completed': False,
             'created_at': datetime.datetime.now()
         })
         db.put(task)
@@ -51,14 +60,16 @@ def add_task(title: str) -> str:
         logging.error(f"DB Error in add_task: {e}")
         return f"Database Error: {str(e)}"
 
-@mcp.tool()
 def list_tasks() -> str:
     """Lists all current tasks."""
+    if db is None:
+        return "Database not available."
     try:
         query = db.query(kind='Task')
         tasks = list(query.fetch())
-        if not tasks: return "Your task list is empty."
-        
+        if not tasks:
+            return "Your task list is empty."
+
         res = ["📋 Current Tasks:"]
         for t in tasks:
             status = "✅" if t.get('completed') else "⏳"
@@ -67,9 +78,10 @@ def list_tasks() -> str:
     except Exception as e:
         return f"Database Error: {str(e)}"
 
-@mcp.tool()
 def complete_task(task_id: str) -> str:
     """Marks a task as complete. Input must be the numeric ID."""
+    if db is None:
+        return "Database not available."
     try:
         numeric_id = int(''.join(filter(str.isdigit, task_id)))
         key = db.key('Task', numeric_id)
@@ -82,9 +94,10 @@ def complete_task(task_id: str) -> str:
     except Exception as e:
         return f"Error processing task ID: {str(e)}"
 
-@mcp.tool()
 def add_note(title: str, content: str) -> str:
     """Saves a detailed note for Dr. Abhishek."""
+    if db is None:
+        return "Database not available."
     try:
         key = db.key('Note')
         note = datastore.Entity(key=key)
@@ -111,7 +124,7 @@ Then, use your tools to complete this request: {user_prompt}
 """
 
 def root_instruction(ctx):
-    # Pulls the prompt directly from the API call
+    # Pulls the prompt directly from the session state set at request time
     raw_input = ctx.state.get("user_input", "Hello")
     return f"""
 1. Save this user input using 'add_prompt_to_state': {raw_input}
@@ -138,21 +151,48 @@ root_agent = Agent(
     sub_agents=[workflow]
 )
 
-# ================= 5. API =================
+# ================= 5. RUNNER SETUP =================
+
+_APP_NAME = "workspace_app"
+_session_service = InMemorySessionService()
+_runner = Runner(agent=root_agent, app_name=_APP_NAME, session_service=_session_service)
+
+# ================= 6. API =================
 
 app = FastAPI()
 
 class UserRequest(BaseModel):
     prompt: str
 
+@app.get("/")
+def home():
+    return {"message": "Productivity Agent Hub is running", "status": "ok"}
+
 @app.post("/api/v1/workspace/chat")
 async def chat(request: UserRequest):
     try:
+        user_id = "default_user"
+        # Create a new session and inject the user prompt into state so that
+        # root_instruction (and workspace_instruction) can read it.
+        session = await _session_service.create_session(
+            app_name=_APP_NAME,
+            user_id=user_id,
+            state={"user_input": request.prompt}
+        )
+
+        content = types.Content(
+            role="user",
+            parts=[types.Part(text=request.prompt)]
+        )
+
         final_reply = ""
-        # Inject user_input into the agent state
-        async for event in root_agent.run_async({"user_input": request.prompt}):
-            if hasattr(event, 'text') and event.text:
-                final_reply = event.text
+        async for event in _runner.run_async(
+            user_id=user_id,
+            session_id=session.id,
+            new_message=content
+        ):
+            if event.is_final_response() and event.content and event.content.parts:
+                final_reply = event.content.parts[0].text
 
         return {
             "status": "success",
