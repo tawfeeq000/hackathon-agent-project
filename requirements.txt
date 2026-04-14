@@ -1,4 +1,4 @@
-google-adk==1.14.0
+google-adk==1.30.0
 fastapi
 uvicorn
 pydantic

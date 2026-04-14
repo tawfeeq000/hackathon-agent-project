@@ -23,7 +23,7 @@ except Exception:
     logging.basicConfig(level=logging.INFO)
 
 load_dotenv()
-model_name = os.getenv("MODEL", "gemini-2.5-flash")
+model_name = os.getenv("MODEL", "gemini-2.0-flash")
 
 # --- 2. Database Setup ---
 # Leaving Client() arguments empty is the most stable way to deploy on Google
@@ -95,7 +95,7 @@ def complete_task(task_id: str) -> str:
         return f"Error processing task ID: {str(e)}"
 
 def add_note(title: str, content: str) -> str:
-    """Saves a detailed note for Dr. Abhishek."""
+    """Saves a detailed note to the workspace."""
     if db is None:
         return "Database not available."
     try:
@@ -118,7 +118,7 @@ def workspace_instruction(ctx):
     # This pulls from the state we set in the root_agent
     user_prompt = ctx.state.get("PROMPT", "Welcome the user.")
     return f"""
-You are the Workspace Executive Assistant for Dr. Abhishek.
+You are the Workspace Executive Assistant.
 Always start with a polite, professional greeting.
 Then, use your tools to complete this request: {user_prompt}
 """
@@ -159,14 +159,26 @@ _runner = Runner(agent=root_agent, app_name=_APP_NAME, session_service=_session_
 
 # ================= 6. API =================
 
-app = FastAPI()
+app = FastAPI(title="Productivity Agent Hub", version="1.0.0")
 
 class UserRequest(BaseModel):
     prompt: str
 
 @app.get("/")
 def home():
-    return {"message": "Productivity Agent Hub is running", "status": "ok"}
+    return {
+        "message": "Productivity Agent Hub is running",
+        "status": "ok",
+        "version": "1.0.0",
+        "endpoints": {
+            "chat": "POST /api/v1/workspace/chat",
+            "health": "GET /health"
+        }
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "healthy", "database": "connected" if db else "disconnected"}
 
 @app.post("/api/v1/workspace/chat")
 async def chat(request: UserRequest):
